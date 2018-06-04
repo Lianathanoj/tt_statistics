@@ -1,5 +1,7 @@
 import itertools
 import numpy
+import pickle
+import pprint
 import re
 import requests
 import time
@@ -10,7 +12,6 @@ from bs4 import BeautifulSoup
 NUM_INT_PLAYERS_LIMIT = 5
 NUM_US_PLAYERS_LIMIT = 5
 NUM_TOURNEYS_LIMIT = 3
-MAX_PLAYERS_PER_PAGE = 1000
 URL = 'https://usatt.simplycompete.com'
 USE_MAX = True
 
@@ -39,7 +40,22 @@ def find_num_players(is_US):
 
     return 0
 
-def get_preliminary_dicts(offset=0, is_US=True):
+def cache_info(func):
+    def wrapper(*args):
+        cache = '.{}{}.pkl'.format(func.__name__, args).replace('/', '_')
+        try:
+            with open(cache, 'rb') as f:
+                return pickle.load(f)
+        except IOError:
+            result = func(*args)
+            with open(cache, 'wb') as f:
+                pickle.dump(result, f)
+            return result
+
+    return wrapper
+
+@cache_info
+def get_preliminary_dicts(offset=0, is_US=False, max_players_per_page=1000):
     player_info_dict = {}
     location_info_dict = {}
     num_players = None
@@ -52,7 +68,7 @@ def get_preliminary_dicts(offset=0, is_US=True):
     while offset < num_players:
         if USE_MAX and offset % 5000 == 0 and offset != 0:
             print('Completed information gathering for {} players.'.format(offset))
-        players_per_page = num_players if num_players < MAX_PLAYERS_PER_PAGE else MAX_PLAYERS_PER_PAGE
+        players_per_page = num_players if num_players < max_players_per_page else max_players_per_page
         players_table = player_table_helper(players_per_page, offset, is_US)
 
         for player_row in players_table.find_all('tr', { 'class': 'list-item' }):
@@ -367,18 +383,22 @@ def main():
     adds to overhead, so we need to fill out the dictionary beforehand for all players (US and international).
     '''
 
-    player_info_dict, location_info_dict = get_preliminary_dicts(is_US=False)
+    player_info_dict, location_info_dict = get_preliminary_dicts()
     print('Finished retrieving preliminary info.')
     print('Number of players in player_info_dict: {}\n'.format(len(player_info_dict)))
 
     total_num_matches = get_main_info(player_info_dict, location_info_dict)
     print('\nFinished retrieiving main info from a total of {} matches.'.format(total_num_matches))
     print('Locations: {}\n'.format(list(location_info_dict.keys())))
-    # print(location_info_dict)
+
+    if not USE_MAX:
+        pprint(location_info_dict)
 
     location_stats = calculate_statistics(location_info_dict)
-    # print(location_stats)
     print('Finished calculating statistics.')
+
+    if not USE_MAX:
+        pprint(location_info_dict)
 
     create_excel_workbook(location_stats)
 
