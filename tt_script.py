@@ -2,24 +2,73 @@ import itertools
 import numpy
 import re
 import requests
+import time
 import xlsxwriter
 
 from bs4 import BeautifulSoup
 
+NUM_INT_PLAYERS_LIMIT = 5
+NUM_US_PLAYERS_LIMIT = 5
+NUM_TOURNEYS_LIMIT = 3
+MAX_PLAYERS_PER_PAGE = 1000
 URL = 'https://usatt.simplycompete.com'
+USE_MAX = True
 
 # helper function to reformat parsed html hrefs
 def retrieve_href(string):
     return string.replace('location.href = \'', '').replace('\';', '')
 
-# gets a list of relevant players
-def get_players_table(is_US=True):
-    players_href = '{}/userAccount/s?max={}&showUsCitizensOnly=on' if is_US else '{}/userAccount/s?max={}'
-    players_request = requests.get(players_href.format(URL, NUM_PLAYERS))
+def player_table_helper(players_per_page, offset, is_US):
+    base_string = '{}/userAccount/s?max={}&offset={}&format=&showUsCitizensOnly=on' if is_US else '{}/userAccount/s?max={}&offset={}'
+    players_href = base_string.format(URL, players_per_page, offset)
+    players_request = requests.get(players_href)
     players_page = BeautifulSoup(players_request.text, 'html.parser')
     players_table = players_page.find_all('table')[1]
 
     return players_table
+
+def find_num_players(is_US):
+    base_string = '{}/userAccount/s?max=5&format=&showUsCitizensOnly=on' if is_US else '{}/userAccount/s?max=5'
+    players_request = requests.get(base_string.format(URL))
+    players_page = BeautifulSoup(players_request.text, 'html.parser')
+
+    for span in players_page.find_all('span'):
+        element = span.find('strong')
+        if element:
+            return int(element.text)
+
+    return 0
+
+def get_preliminary_dicts(offset=0, is_US=True):
+    player_info_dict = {}
+    location_info_dict = {}
+    num_players = None
+
+    if USE_MAX:
+        num_players = find_num_players(is_US)
+    else:
+        num_players = NUM_US_PLAYERS_LIMIT if is_US else NUM_INT_PLAYERS_LIMIT
+
+    while offset < num_players:
+        if USE_MAX and offset % 5000 == 0 and offset != 0:
+            print('Completed information gathering for {} players.'.format(offset))
+        players_per_page = num_players if num_players < MAX_PLAYERS_PER_PAGE else MAX_PLAYERS_PER_PAGE
+        players_table = player_table_helper(players_per_page, offset, is_US)
+
+        for player_row in players_table.find_all('tr', { 'class': 'list-item' }):
+            player_url = retrieve_href(player_row['onclick'])
+            player_id = int(re.search(r'.*\/(.*)\?', player_url).group(1))
+            location = player_row.find_all('td')[5].text.split(',')[-1].strip()
+            location = ' UNKNOWN' if location is '' else location
+            rating = int(player_row.find_all('td')[6].text)
+
+            player_info_dict[player_id] = (location, rating)
+            location_info_dict[location] = { 'W': {}, 'L': {} }
+
+        offset += players_per_page
+        time.sleep(1)
+
+    return player_info_dict, location_info_dict
 
 # adds player to player_info_dict if not existent
 def add_player(player_id, player_info_dict, nonexistent_usatt_ids):
@@ -38,69 +87,149 @@ def add_player(player_id, player_info_dict, nonexistent_usatt_ids):
         location = player_row.find_all('td')[5].text.split(',')[-1].strip()
         rating = int(player_row.find_all('td')[6].text)
 
-        player_info_dict[player_id] = (location, rating)
+        player_info_dict[player_id] = (' UNKNOWN' if location is '' else location, rating)
         print('Added {} to player_info_dict.'.format(player_id))
     except:
         if usatt_id not in nonexistent_usatt_ids:
             print('USATT number {} does not exist.'.format(usatt_id))
             nonexistent_usatt_ids.append(usatt_id)
 
-# find all players and apply mapping to a dict of player --> region, rating
-# setup location dict for each state
-def get_preliminary_info(players_table, player_info_dict, location_info_dict):
-    for player_row in players_table.find_all('tr', { 'class': 'list-item' }):
-        player_url = retrieve_href(player_row['onclick'])
-        player_id = int(re.search(r'.*\/(.*)\?', player_url).group(1))
-        location = player_row.find_all('td')[5].text.split(',')[-1].strip()
-        rating = int(player_row.find_all('td')[6].text)
+def find_num_tourneys():
+    tourneys_href = '{}/t/search'.format(URL)
+    tourneys_request = requests.get(tourneys_href)
+    tourneys_page = BeautifulSoup(tourneys_request.text, 'html.parser')
 
-        player_info_dict[player_id] = (location, rating)
-        location_info_dict[location] = { 'W': {}, 'L': {} }
+    return int(tourneys_page.find('strong').text)
+
+def get_tourney_ids(tourneys_per_page=100, offset=0):
+    tourney_ids = []
+    num_tourneys = find_num_tourneys() if USE_MAX else NUM_TOURNEYS_LIMIT
+
+    if tourneys_per_page > num_tourneys:
+        tourneys_per_page = num_tourneys
+
+    while offset < num_tourneys:
+        tourneys_href = '{}/t/search?max={}&offset={}'.format(URL, tourneys_per_page, offset)
+        tourneys_request = requests.get(tourneys_href)
+        tourneys_page = BeautifulSoup(tourneys_request.text, 'html.parser')
+        tourneys_table = tourneys_page.find('table')
+
+        for tourney in tourneys_table.find_all('tr', { 'class': 'list-item' }):
+            tourney_url = retrieve_href(tourney['onclick'])
+            tourney_id = int(re.search(r'.*\/(.*)\?', tourney_url).group(1))
+            tourney_ids.append(tourney_id)
+
+        offset += tourneys_per_page
+
+    return tourney_ids
 
 # get rating difference for match winners and losers
-def get_main_info(players_table, player_info_dict, location_info_dict, nonexistent_usatt_ids):
-    for index, player_row in enumerate(players_table.find_all('tr', { 'class': 'list-item' })):
-        if NUM_PLAYERS > 50 and index % (NUM_PLAYERS // 10):
-            print('Finished retrieiving info for {} players'.format(index))
+def get_main_info(player_info_dict, location_info_dict, matches_per_page=100):
+    def tourney_page_helper(offset, nonexistent_usatt_ids):
+        num_matches = 0
+        tourney_string = '{}/t/tr/{}?max={}&offset={}'.format(URL, tourney_id, matches_per_page, offset)
+        apply_timeout = True
+        tourney_request = None
 
-        player_url = retrieve_href(player_row['onclick'])
-        player_id = int(re.search(r'.*\/(.*)\?', player_url).group(1))
-        player_tourneys_request = requests.get('{}/userAccount/trn/{}'.format(URL, player_id))
-        player_tourneys_page = BeautifulSoup(player_tourneys_request.text, 'html.parser')
+        while apply_timeout:
+            try:
+                tourney_request = requests.get(tourney_string)
+                apply_timeout = False
+            except requests.exceptions.Timeout:
+                print('Encountered timeout error. Waiting 60 seconds until trying again.')
+                time.sleep(60)
+            except ConnectionError:
+                print('Connection has been aborted. Waiting 60 seconds until trying again.')
+                time.sleep(60)
+            except:
+                print('Error has occurred. Waiting 60 seconds until trying again.')
+                time.sleep(60)
 
-        for tournament in player_tourneys_page.find_all('tr', { 'class': 'list-item' }):
-            player_tourney_string = retrieve_href(tournament['onclick'])
-            player_matches_request = requests.get('{}{}'.format(URL, player_tourney_string))
-            player_matches_page = BeautifulSoup(player_matches_request.text, 'html.parser')
-            player_matches = player_matches_page.find_all('td', { 'class': 'clickable' })
+        tourney_page = BeautifulSoup(tourney_request.text, 'html.parser')
+        player_matches = tourney_page.find_all('td', { 'class': 'clickable' })
 
-            for winner, loser in zip(player_matches[0::2], player_matches[1::2]):
-                winner_id = None
-                loser_id = None
+        for winner, loser in zip(player_matches[0::2], player_matches[1::2]):
+            num_matches += 1
+            winner_id = None
+            loser_id = None
 
-                try:
-                    winner_id = int(re.search(r'\?uai=(\d+)&', retrieve_href(winner['onclick'])).group(1))
-                    loser_id = int(re.search(r'\?uai=(\d+)&', retrieve_href(loser['onclick'])).group(1))
-                except KeyError:
+            try:
+                winner_id = int(re.search(r'\?uai=(\d+)&', retrieve_href(winner['onclick'])).group(1))
+                loser_id = int(re.search(r'\?uai=(\d+)&', retrieve_href(loser['onclick'])).group(1))
+            except KeyError:
+                continue
+
+            if winner_id not in player_info_dict:
+                if USE_MAX:
+                    # print('Skipping {}'.format(winner_id))
                     continue
+                add_player(winner_id, player_info_dict, nonexistent_usatt_ids)
 
-                player_location, player_rating = player_info_dict[player_id]
-                outcome, opponent_id = ('W', loser_id) if winner_id == player_id else ('L', winner_id)
-
-                if opponent_id not in player_info_dict:
-                    # continue
-                    add_player(opponent_id, player_info_dict, nonexistent_usatt_ids)
-
-                try:
-                    opponent_location, opponent_rating = player_info_dict[opponent_id]
-                except:
+            if loser_id not in player_info_dict:
+                if USE_MAX:
+                    # print('Skipping {}'.format(loser_id))
                     continue
+                add_player(loser_id, player_info_dict, nonexistent_usatt_ids)
 
-                if opponent_location in location_info_dict[player_location][outcome]:
-                    # i.e. if the current player beats a higher-rated player, a negative number will be appended to the list
-                    location_info_dict[player_location][outcome][opponent_location].append(player_rating - opponent_rating)
-                else:
-                    location_info_dict[player_location][outcome][opponent_location] = []
+            try:
+                winner_location, winner_rating = player_info_dict[winner_id]
+                loser_location, loser_rating = player_info_dict[loser_id]
+            except:
+                continue
+
+            if loser_location not in location_info_dict:
+                location_info_dict[loser_location] = { 'W': {}, 'L': {} }
+            if winner_location not in location_info_dict:
+                location_info_dict[winner_location] = { 'W': {}, 'L': {} }
+
+            if winner_location in location_info_dict[loser_location]['L']:
+                # i.e. if the player loses to a higher-rated player, a positive number will be appended to the list.
+                location_info_dict[loser_location]['L'][winner_location].append(winner_rating - loser_rating)
+            else:
+                location_info_dict[loser_location]['L'][winner_location] = [winner_rating - loser_rating]
+
+            if loser_location in location_info_dict[winner_location]['W']:
+                # i.e. if the player beats a higher-rated player, a positive number will be appended to the list.
+                location_info_dict[winner_location]['W'][loser_location].append(loser_rating - winner_rating)
+            else:
+                location_info_dict[winner_location]['W'][loser_location] = [loser_rating - winner_rating]
+
+        return num_matches, tourney_page
+
+    tourney_ids = get_tourney_ids()
+    num_tourneys = len(tourney_ids)
+    nonexistent_usatt_ids = []
+    total_num_matches = 0
+
+    for index, tourney_id in enumerate(tourney_ids):
+        offset = 0
+
+        if USE_MAX and index % 50 == 0 and index != 0:
+            print('Completed information gathering for {} tournaments.'.format(index))
+
+        num_matches, tourney_page = tourney_page_helper(offset, nonexistent_usatt_ids)
+        total_num_matches += num_matches
+        offset += matches_per_page
+        offset_limit = None
+
+        try:
+            if (tourney_page.find('span', { 'class': ['step', 'gap'] })):
+                offset_limit = int(re.search(r'offset=(\d+)', tourney_page.find('span', { 'class': ['step', 'gap'] }).next_sibling['href']).group(1))
+            else:
+                offset_limit = int(re.search(r'offset=(\d+)', tourney_page.find_all('a', { 'class': 'step'})[-1]['href']).group(1))
+        except:
+            offset_limit = 0
+
+        while offset <= offset_limit:
+            num_matches, tourney_page = tourney_page_helper(offset, nonexistent_usatt_ids)
+            total_num_matches += num_matches
+            offset += matches_per_page
+
+            time.sleep(0.5)
+
+        time.sleep(1)
+
+    return total_num_matches
 
 def calculate_statistics_helper(losses, wins):
     win_ratio = None
@@ -110,7 +239,7 @@ def calculate_statistics_helper(losses, wins):
     try:
         win_ratio = num_wins / (num_wins + num_losses)
     except ZeroDivisionError:
-        win_ratio = 'N/A'
+        win_ratio = 1
 
     return {
         'avg_win_rating_diff': numpy.mean(wins) if wins else 'N/A',
@@ -194,8 +323,8 @@ def create_state_statistics_worksheet(location_stats, workbook):
     states_worksheet = workbook.add_worksheet('State Statistics')
     stats = sorted(['avg_loss_rating_diff', 'avg_win_rating_diff', 'median_loss_rating_diff', 'median_win_rating_diff', 'num_losses', 'num_wins', 'win_ratio'])
     stat_title_row_index = 0
-    sorted_locations = sorted(location_stats.keys())
-    sorted_states = list(set(itertools.chain.from_iterable([list(location_stats[location]['states_stats'].keys()) for location in location_stats])))
+    sorted_locations = sorted([location for location in location_stats if location_stats[location]['states_stats']])
+    sorted_states = sorted(list(set(itertools.chain.from_iterable([list(location_stats[location]['states_stats'].keys()) for location in location_stats]))))
     sorted_states_index_mapping = { state: index for index, state in enumerate(sorted_states) }
 
     states_worksheet.set_column(0, 0, 20)
@@ -232,26 +361,18 @@ def create_excel_workbook(location_stats):
         return print('Not enough data to create an excel workbook.')
 
 def main():
-    player_info_dict = {}
-    location_info_dict = {}
-    nonexistent_usatt_ids = []
+    '''
+    for large subsets of data, if we limit the player_info_dict to only US, then we fail to account for american players
+    vs international players in certain matches. Individually adding the international players is an arduous process and
+    adds to overhead, so we need to fill out the dictionary beforehand for all players (US and international).
+    '''
 
-    players_table = get_players_table(is_US=False)
-
-    get_preliminary_info(players_table, player_info_dict, location_info_dict)
+    player_info_dict, location_info_dict = get_preliminary_dicts(is_US=False)
     print('Finished retrieving preliminary info.')
-    print('Number of players: {}\n'.format(len(player_info_dict)))
+    print('Number of players in player_info_dict: {}\n'.format(len(player_info_dict)))
 
-
-    '''
-    for large subsets of data, if we limit it to only US, then we fail to account for american players
-    vs international players. Individually adding the international players is an arduous process, so
-    if we fill the dictionary beforehand for all players and then limit to US for getting the main info,
-    we can speed up the script.
-    '''
-
-    get_main_info(players_table, player_info_dict, location_info_dict, nonexistent_usatt_ids)
-    print('Finished retrieiving main info.')
+    total_num_matches = get_main_info(player_info_dict, location_info_dict)
+    print('\nFinished retrieiving main info from a total of {} matches.'.format(total_num_matches))
     print('Locations: {}\n'.format(list(location_info_dict.keys())))
     # print(location_info_dict)
 
