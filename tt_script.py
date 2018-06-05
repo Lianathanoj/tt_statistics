@@ -1,9 +1,12 @@
 import itertools
 import numpy
+import os
+import pandas as pd
 import pickle
 import pprint
 import re
 import requests
+import string
 import time
 import xlsxwriter
 
@@ -15,7 +18,36 @@ NUM_TOURNEYS_LIMIT = 3
 URL = 'https://usatt.simplycompete.com'
 USE_MAX = True
 
-# helper function to reformat parsed html hrefs
+def cache_info(func):
+    def wrapper(*args):
+        cache = './pickle/{}'.format('.{}.pkl'.format(func.__name__).replace('/', '_'))
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+
+        try:
+            with open(cache, 'rb') as f:
+                return pickle.load(f)
+        except IOError:
+            result = func(*args)
+            with open(cache, 'wb') as f:
+                pickle.dump(result, f)
+            return result
+ 
+    return wrapper
+
+@cache_info
+def parse_us_cities_states_csv():
+    us_cities_states_dict = {}
+    fields = ['City', 'State short', 'City alias']
+    df = pd.read_csv('./us_cities_states_counties.csv', sep='|', usecols=fields)
+
+    for index, row in df.iterrows():
+        us_cities_states_dict[row['City']] = row['State short']
+
+        if row['City alias'] != '':
+            us_cities_states_dict[row['City alias']] = row['State short']
+
+    return us_cities_states_dict
+
 def retrieve_href(string):
     return string.replace('location.href = \'', '').replace('\';', '')
 
@@ -40,22 +72,35 @@ def find_num_players(is_US):
 
     return 0
 
-def cache_info(func):
-    def wrapper(*args):
-        cache = '.{}{}.pkl'.format(func.__name__, args).replace('/', '_')
-        try:
-            with open(cache, 'rb') as f:
-                return pickle.load(f)
-        except IOError:
-            result = func(*args)
-            with open(cache, 'wb') as f:
-                pickle.dump(result, f)
-            return result
+def reformat_location(location):
+    if len(location) in [2, 3]:
+        return location.upper()
+    return string.capwords(location.lower())
 
-    return wrapper
+def parse_player_info(us_cities_states_dict, player_row):
+    player_url = retrieve_href(player_row['onclick'])
+    player_id = int(re.search(r'.*\/(.*)\?', player_url).group(1))
+    rating = int(player_row.find_all('td')[6].text)
+    locations = player_row.find_all('td')[5].text.split(',')
+    main_location = reformat_location(locations[-1].strip())
+    backup_location = reformat_location(locations[0].strip())
+    selected_location = None
+
+    if main_location == '':
+        if backup_location == '':
+            selected_location = ' OTHER'
+        else:
+            if backup_location in us_cities_states_dict:
+                selected_location = us_cities_states_dict[backup_location]
+            else:
+                selected_location = ' OTHER'
+    else:
+        selected_location = main_location
+
+    return player_id, rating, selected_location
 
 @cache_info
-def get_preliminary_dicts(offset=0, is_US=False, max_players_per_page=1000):
+def get_preliminary_dicts(us_cities_states_dict, offset=0, is_US=False, max_players_per_page=1000):
     player_info_dict = {}
     location_info_dict = {}
     num_players = None
@@ -72,14 +117,10 @@ def get_preliminary_dicts(offset=0, is_US=False, max_players_per_page=1000):
         players_table = player_table_helper(players_per_page, offset, is_US)
 
         for player_row in players_table.find_all('tr', { 'class': 'list-item' }):
-            player_url = retrieve_href(player_row['onclick'])
-            player_id = int(re.search(r'.*\/(.*)\?', player_url).group(1))
-            location = player_row.find_all('td')[5].text.split(',')[-1].strip()
-            location = ' UNKNOWN' if location is '' else location
-            rating = int(player_row.find_all('td')[6].text)
+            player_id, rating, selected_location = parse_player_info(us_cities_states_dict, player_row)
 
-            player_info_dict[player_id] = (location, rating)
-            location_info_dict[location] = { 'W': {}, 'L': {} }
+            player_info_dict[player_id] = (selected_location, rating)
+            location_info_dict[selected_location] = { 'W': {}, 'L': {} }
 
         offset += players_per_page
         time.sleep(1)
@@ -87,7 +128,7 @@ def get_preliminary_dicts(offset=0, is_US=False, max_players_per_page=1000):
     return player_info_dict, location_info_dict
 
 # adds player to player_info_dict if not existent
-def add_player(player_id, player_info_dict, nonexistent_usatt_ids):
+def add_player(player_id, player_info_dict, us_cities_states_dict, nonexistent_usatt_ids):
     player_request = requests.get('{}/userAccount/up/{}'.format(URL, player_id))
     player_page = BeautifulSoup(player_request.text, 'html.parser')
 
@@ -98,12 +139,9 @@ def add_player(player_id, player_info_dict, nonexistent_usatt_ids):
     try:
         table = filter_page.find_all('table')[1]
         player_row = table.find('tr', { 'class': 'list-item' })
-        player_url = retrieve_href(player_row['onclick'])
-        player_id = int(re.search(r'.*\/(.*)\?', player_url).group(1))
-        location = player_row.find_all('td')[5].text.split(',')[-1].strip()
-        rating = int(player_row.find_all('td')[6].text)
+        player_id, rating, selected_location = parse_player_info(us_cities_states_dict, player_row)
 
-        player_info_dict[player_id] = (' UNKNOWN' if location is '' else location, rating)
+        player_info_dict[player_id] = (selected_location, rating)
         print('Added {} to player_info_dict.'.format(player_id))
     except:
         if usatt_id not in nonexistent_usatt_ids:
@@ -139,8 +177,7 @@ def get_tourney_ids(tourneys_per_page=100, offset=0):
 
     return tourney_ids
 
-# get rating difference for match winners and losers
-def get_main_info(player_info_dict, location_info_dict, matches_per_page=100):
+def get_main_info(player_info_dict, location_info_dict, us_cities_states_dict, matches_per_page=100):
     def tourney_page_helper(offset, nonexistent_usatt_ids):
         num_matches = 0
         tourney_string = '{}/t/tr/{}?max={}&offset={}'.format(URL, tourney_id, matches_per_page, offset)
@@ -179,13 +216,13 @@ def get_main_info(player_info_dict, location_info_dict, matches_per_page=100):
                 if USE_MAX:
                     # print('Skipping {}'.format(winner_id))
                     continue
-                add_player(winner_id, player_info_dict, nonexistent_usatt_ids)
+                add_player(winner_id, player_info_dict, us_cities_states_dict, nonexistent_usatt_ids)
 
             if loser_id not in player_info_dict:
                 if USE_MAX:
                     # print('Skipping {}'.format(loser_id))
                     continue
-                add_player(loser_id, player_info_dict, nonexistent_usatt_ids)
+                add_player(loser_id, player_info_dict, us_cities_states_dict, nonexistent_usatt_ids)
 
             try:
                 winner_location, winner_rating = player_info_dict[winner_id]
@@ -255,7 +292,10 @@ def calculate_statistics_helper(losses, wins):
     try:
         win_ratio = num_wins / (num_wins + num_losses)
     except ZeroDivisionError:
-        win_ratio = 1
+        if num_wins > 0:
+            win_ratio = 1
+        else:
+            win_ratio = 0
 
     return {
         'avg_win_rating_diff': numpy.mean(wins) if wins else 'N/A',
@@ -318,19 +358,20 @@ def calculate_statistics(location_info_dict):
 
 def create_aggregated_statistics_worksheet(location_stats, workbook):
     aggregate_states_worksheet = workbook.add_worksheet('State Aggregated Statistics')
-    first_location = list(location_stats.keys())[0]
+    sorted_locations = sorted([location for location in location_stats if location_stats[location]['states_stats']], key=lambda loc: (len(loc), loc))
+    first_location = sorted_locations[0]
 
     aggregate_states_worksheet.set_column(0, 0, 20)
 
-    for row_index, stat_name in enumerate(sorted([stat_name for stat_name in location_stats[first_location].keys() if stat_name is not 'states_stats']), 1):
+    for row_index, stat_name in enumerate(sorted([stat_name for stat_name in location_stats[first_location].keys() if stat_name != 'states_stats']), 1):
         aggregate_states_worksheet.write(row_index, 0, stat_name, workbook.add_format({ 'bold': True }))
 
-    for col_index, location in enumerate(sorted(location_stats.keys()), 1):
+    for col_index, location in enumerate(sorted_locations, 1):
         aggregate_states_worksheet.write(0, col_index, location, workbook.add_format({ 'bold': True, 'align': 'center' }))
 
-        for row_index, stat_name in enumerate(sorted([stat_name for stat_name in location_stats[location].keys() if stat_name is not 'states_stats']), 1):
+        for row_index, stat_name in enumerate(sorted([stat_name for stat_name in location_stats[location].keys() if stat_name != 'states_stats']), 1):
             try:
-                if stat_name is not 'states_stats':
+                if stat_name != 'states_stats':
                     aggregate_states_worksheet.write(row_index, col_index, location_stats[location][stat_name], workbook.add_format({ 'align': 'center' }))
             except TypeError:
                 continue
@@ -339,8 +380,8 @@ def create_state_statistics_worksheet(location_stats, workbook):
     states_worksheet = workbook.add_worksheet('State Statistics')
     stats = sorted(['avg_loss_rating_diff', 'avg_win_rating_diff', 'median_loss_rating_diff', 'median_win_rating_diff', 'num_losses', 'num_wins', 'win_ratio'])
     stat_title_row_index = 0
-    sorted_locations = sorted([location for location in location_stats if location_stats[location]['states_stats']])
-    sorted_states = sorted(list(set(itertools.chain.from_iterable([list(location_stats[location]['states_stats'].keys()) for location in location_stats]))))
+    sorted_locations = sorted([location for location in location_stats if location_stats[location]['states_stats']], key=lambda loc: (len(loc), loc))
+    sorted_states = sorted(list(set(itertools.chain.from_iterable([list(location_stats[location]['states_stats'].keys()) for location in location_stats]))), key=lambda loc: (len(loc), loc))
     sorted_states_index_mapping = { state: index for index, state in enumerate(sorted_states) }
 
     states_worksheet.set_column(0, 0, 20)
@@ -377,19 +418,22 @@ def create_excel_workbook(location_stats):
         return print('Not enough data to create an excel workbook.')
 
 def main():
+    us_cities_states_dict = parse_us_cities_states_csv()
+    print('Finished parsing csv file.')
+
     '''
     for large subsets of data, if we limit the player_info_dict to only US, then we fail to account for american players
     vs international players in certain matches. Individually adding the international players is an arduous process and
     adds to overhead, so we need to fill out the dictionary beforehand for all players (US and international).
     '''
 
-    player_info_dict, location_info_dict = get_preliminary_dicts()
+    player_info_dict, location_info_dict = get_preliminary_dicts(us_cities_states_dict)
     print('Finished retrieving preliminary info.')
     print('Number of players in player_info_dict: {}\n'.format(len(player_info_dict)))
 
-    total_num_matches = get_main_info(player_info_dict, location_info_dict)
-    print('\nFinished retrieiving main info from a total of {} matches.'.format(total_num_matches))
-    print('Locations: {}\n'.format(list(location_info_dict.keys())))
+    total_num_matches = get_main_info(player_info_dict, location_info_dict, us_cities_states_dict)
+    print('Finished retrieiving main info from a total of {} matches.'.format(total_num_matches))
+    print('Locations: {}\n'.format(sorted(list(location_info_dict.keys()))), key=lambda loc: (len(loc), loc))
 
     if not USE_MAX:
         pprint(location_info_dict)
