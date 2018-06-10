@@ -1,3 +1,4 @@
+import copy
 import itertools
 import numpy
 import os
@@ -177,7 +178,10 @@ def get_tourney_ids(tourneys_per_page=100, offset=0):
 
     return tourney_ids
 
+@cache_info
 def get_main_info(player_info_dict, location_info_dict, us_cities_states_dict, matches_per_page=100):
+    populated_location_info_dict = copy.deepcopy(location_info_dict)
+
     def tourney_page_helper(offset, nonexistent_usatt_ids):
         num_matches = 0
         tourney_string = '{}/t/tr/{}?max={}&offset={}'.format(URL, tourney_id, matches_per_page, offset)
@@ -214,13 +218,11 @@ def get_main_info(player_info_dict, location_info_dict, us_cities_states_dict, m
 
             if winner_id not in player_info_dict:
                 if USE_MAX:
-                    # print('Skipping {}'.format(winner_id))
                     continue
                 add_player(winner_id, player_info_dict, us_cities_states_dict, nonexistent_usatt_ids)
 
             if loser_id not in player_info_dict:
                 if USE_MAX:
-                    # print('Skipping {}'.format(loser_id))
                     continue
                 add_player(loser_id, player_info_dict, us_cities_states_dict, nonexistent_usatt_ids)
 
@@ -230,22 +232,22 @@ def get_main_info(player_info_dict, location_info_dict, us_cities_states_dict, m
             except:
                 continue
 
-            if loser_location not in location_info_dict:
-                location_info_dict[loser_location] = { 'W': {}, 'L': {} }
-            if winner_location not in location_info_dict:
-                location_info_dict[winner_location] = { 'W': {}, 'L': {} }
+            if loser_location not in populated_location_info_dict:
+                populated_location_info_dict[loser_location] = { 'W': {}, 'L': {} }
+            if winner_location not in populated_location_info_dict:
+                populated_location_info_dict[winner_location] = { 'W': {}, 'L': {} }
 
-            if winner_location in location_info_dict[loser_location]['L']:
+            if winner_location in populated_location_info_dict[loser_location]['L']:
                 # i.e. if the player loses to a higher-rated player, a positive number will be appended to the list.
-                location_info_dict[loser_location]['L'][winner_location].append(winner_rating - loser_rating)
+                populated_location_info_dict[loser_location]['L'][winner_location].append(winner_rating - loser_rating)
             else:
-                location_info_dict[loser_location]['L'][winner_location] = [winner_rating - loser_rating]
+                populated_location_info_dict[loser_location]['L'][winner_location] = [winner_rating - loser_rating]
 
-            if loser_location in location_info_dict[winner_location]['W']:
+            if loser_location in populated_location_info_dict[winner_location]['W']:
                 # i.e. if the player beats a higher-rated player, a positive number will be appended to the list.
-                location_info_dict[winner_location]['W'][loser_location].append(loser_rating - winner_rating)
+                populated_location_info_dict[winner_location]['W'][loser_location].append(loser_rating - winner_rating)
             else:
-                location_info_dict[winner_location]['W'][loser_location] = [loser_rating - winner_rating]
+                populated_location_info_dict[winner_location]['W'][loser_location] = [loser_rating - winner_rating]
 
         return num_matches, tourney_page
 
@@ -282,7 +284,7 @@ def get_main_info(player_info_dict, location_info_dict, us_cities_states_dict, m
 
         time.sleep(1)
 
-    return total_num_matches
+    return total_num_matches, populated_location_info_dict
 
 def calculate_statistics_helper(losses, wins):
     win_ratio = None
@@ -431,18 +433,18 @@ def main():
     print('Finished retrieving preliminary info.')
     print('Number of players in player_info_dict: {}\n'.format(len(player_info_dict)))
 
-    total_num_matches = get_main_info(player_info_dict, location_info_dict, us_cities_states_dict)
+    total_num_matches, populated_location_info_dict = get_main_info(player_info_dict, location_info_dict, us_cities_states_dict)
     print('Finished retrieiving main info from a total of {} matches.'.format(total_num_matches))
-    print('Locations: {}\n'.format(sorted(list(location_info_dict.keys()))), key=lambda loc: (len(loc), loc))
+    print('Locations: {}\n'.format(sorted(list(populated_location_info_dict.keys())), key=lambda loc: (len(loc), loc)))
 
     if not USE_MAX:
-        pprint(location_info_dict)
+        pprint(populated_location_info_dict)
 
-    location_stats = calculate_statistics(location_info_dict)
+    location_stats = calculate_statistics(populated_location_info_dict)
     print('Finished calculating statistics.')
 
     if not USE_MAX:
-        pprint(location_info_dict)
+        pprint(populated_location_info_dict)
 
     create_excel_workbook(location_stats)
 
