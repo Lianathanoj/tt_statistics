@@ -4,7 +4,6 @@ import numpy
 import os
 import pandas as pd
 import pickle
-import pprint
 import re
 import requests
 import string
@@ -12,6 +11,8 @@ import time
 import xlsxwriter
 
 from bs4 import BeautifulSoup
+from intervaltree import IntervalTree
+from pprint import pprint
 
 NUM_INT_PLAYERS_LIMIT = 5
 NUM_US_PLAYERS_LIMIT = 5
@@ -100,8 +101,24 @@ def parse_player_info(us_cities_states_dict, player_row):
 
     return player_id, rating, selected_location
 
+def create_interval_tree():
+    rating_intervals = IntervalTree()
+    rating_intervals[0:250] = '0:250' 
+    rating_intervals[250:500] = '251:500'
+    rating_intervals[500:750] = '501:750'
+    rating_intervals[750:1000] = '751:1000'
+    rating_intervals[1000:1250] = '1001:1250'
+    rating_intervals[1250:1500] = '1251:1500'
+    rating_intervals[1500:1750] = '1501:1750'
+    rating_intervals[1750:2000] = '1751:2000'
+    rating_intervals[2000:2250] = '2001:2250'
+    rating_intervals[2250:2500] = '2251:2500'
+    rating_intervals[2500:4000] = '2501+'
+
+    return rating_intervals
+
 @cache_info
-def get_preliminary_dicts(us_cities_states_dict, offset=0, is_US=False, max_players_per_page=1000):
+def get_preliminary_dicts(rating_intervals, us_cities_states_dict, offset=0, is_US=False, max_players_per_page=1000):
     player_info_dict = {}
     location_info_dict = {}
     num_players = None
@@ -121,7 +138,19 @@ def get_preliminary_dicts(us_cities_states_dict, offset=0, is_US=False, max_play
             player_id, rating, selected_location = parse_player_info(us_cities_states_dict, player_row)
 
             player_info_dict[player_id] = (selected_location, rating)
-            location_info_dict[selected_location] = { 'W': {}, 'L': {} }
+            rating_range = None
+
+            try:
+                rating_range = rating_intervals[rating].pop().data
+            except:
+                continue
+
+            if rating_range in location_info_dict:
+                if selected_location not in location_info_dict[rating_range]:
+                    location_info_dict[rating_range][selected_location]  = { 'W': {}, 'L': {} }
+            else:
+                location_info_dict[rating_range] = {}
+                location_info_dict[rating_range][selected_location] = { 'W': {}, 'L': {} }
 
         offset += players_per_page
         time.sleep(1)
@@ -157,8 +186,8 @@ def find_num_tourneys():
     return int(tourneys_page.find('strong').text)
 
 def get_tourney_ids(tourneys_per_page=100, offset=0):
-    tourney_ids = []
     num_tourneys = find_num_tourneys() if USE_MAX else NUM_TOURNEYS_LIMIT
+    tourney_ids = []
 
     if tourneys_per_page > num_tourneys:
         tourneys_per_page = num_tourneys
@@ -179,9 +208,7 @@ def get_tourney_ids(tourneys_per_page=100, offset=0):
     return tourney_ids
 
 @cache_info
-def get_main_info(player_info_dict, location_info_dict, us_cities_states_dict, matches_per_page=100):
-    populated_location_info_dict = copy.deepcopy(location_info_dict)
-
+def get_main_info(rating_intervals, player_info_dict, location_info_dict, us_cities_states_dict, matches_per_page=100):
     def tourney_page_helper(offset, nonexistent_usatt_ids):
         num_matches = 0
         tourney_string = '{}/t/tr/{}?max={}&offset={}'.format(URL, tourney_id, matches_per_page, offset)
@@ -229,25 +256,39 @@ def get_main_info(player_info_dict, location_info_dict, us_cities_states_dict, m
             try:
                 winner_location, winner_rating = player_info_dict[winner_id]
                 loser_location, loser_rating = player_info_dict[loser_id]
+                winner_rating_interval = None
+                loser_rating_interval = None
+
+                try:
+                    winner_rating_interval = rating_intervals[winner_rating].pop().data
+                    loser_rating_interval = rating_intervals[loser_rating].pop().data
+                except:
+                    continue
             except:
                 continue
 
-            if loser_location not in populated_location_info_dict:
-                populated_location_info_dict[loser_location] = { 'W': {}, 'L': {} }
-            if winner_location not in populated_location_info_dict:
-                populated_location_info_dict[winner_location] = { 'W': {}, 'L': {} }
+            if loser_rating_interval not in location_info_dict:
+                location_info_dict[loser_rating_interval] = {}
+            if winner_rating_interval not in location_info_dict:
+                location_info_dict[winner_rating_interval] = {}
 
-            if winner_location in populated_location_info_dict[loser_location]['L']:
+            if loser_location not in location_info_dict[loser_rating_interval]:
+                location_info_dict[loser_rating_interval][loser_location] = { 'W': {}, 'L': {} }
+            if winner_location not in location_info_dict[winner_rating_interval]:
+                location_info_dict[winner_rating_interval][winner_location] = { 'W': {}, 'L': {} }
+
+            if winner_location in location_info_dict[loser_rating_interval][loser_location]['L']:
                 # i.e. if the player loses to a higher-rated player, a positive number will be appended to the list.
-                populated_location_info_dict[loser_location]['L'][winner_location].append(winner_rating - loser_rating)
+                location_info_dict[loser_rating_interval][loser_location]['L'][winner_location].append(winner_rating - loser_rating)
             else:
-                populated_location_info_dict[loser_location]['L'][winner_location] = [winner_rating - loser_rating]
+                location_info_dict[loser_rating_interval][loser_location]['L'][winner_location] = [winner_rating - loser_rating]
 
-            if loser_location in populated_location_info_dict[winner_location]['W']:
+            if loser_location in location_info_dict[winner_rating_interval][winner_location]['W']:
                 # i.e. if the player beats a higher-rated player, a positive number will be appended to the list.
-                populated_location_info_dict[winner_location]['W'][loser_location].append(loser_rating - winner_rating)
+                location_info_dict[winner_rating_interval][winner_location]['W'][loser_location].append(loser_rating - winner_rating)
             else:
-                populated_location_info_dict[winner_location]['W'][loser_location] = [loser_rating - winner_rating]
+                location_info_dict[winner_rating_interval][winner_location]['W'][loser_location] = [loser_rating - winner_rating]
+                
 
         return num_matches, tourney_page
 
@@ -284,6 +325,8 @@ def get_main_info(player_info_dict, location_info_dict, us_cities_states_dict, m
 
         time.sleep(1)
 
+    populated_location_info_dict = copy.deepcopy(location_info_dict)
+
     return total_num_matches, populated_location_info_dict
 
 def calculate_statistics_helper(losses, wins):
@@ -314,107 +357,103 @@ def calculate_statistics(location_info_dict):
     losses_by_state = None
     wins_by_state = None
 
-    for location in location_info_dict:
-        losses_by_state = location_info_dict[location]['L']
-        wins_by_state = location_info_dict[location]['W']
-        states_stats = {}
+    for rating_interval in location_info_dict:
+        for location in location_info_dict[rating_interval]:
+            losses_by_state = location_info_dict[rating_interval][location]['L']
+            wins_by_state = location_info_dict[rating_interval][location]['W']
+            states_stats = {}
 
-        for state in losses_by_state:
-            losses = losses_by_state[state]
-            states_stats[state] = {
-                'avg_loss_rating_diff': numpy.mean(losses) if losses else 'N/A',
-                'avg_win_rating_diff': 'N/A',
-                'median_loss_rating_diff': numpy.median(losses) if losses else 'N/A',
-                'median_win_rating_diff': 'N/A',
-                'num_losses': len(losses) if losses else 'N/A',
-                'num_wins': 'N/A',
-                'win_ratio': 'N/A'
-            }
+            for state in losses_by_state:
+                losses = losses_by_state[state]
+                states_stats[state] = {
+                    'avg_loss_rating_diff': numpy.mean(losses) if losses else 'N/A',
+                    'avg_win_rating_diff': 'N/A',
+                    'median_loss_rating_diff': numpy.median(losses) if losses else 'N/A',
+                    'median_win_rating_diff': 'N/A',
+                    'num_losses': len(losses) if losses else 'N/A',
+                    'num_wins': 'N/A',
+                    'win_ratio': 'N/A'
+                }
 
-        for state in wins_by_state:
-            wins = wins_by_state[state]
-            win_ratio = None
+            for state in wins_by_state:
+                wins = wins_by_state[state]
+                win_ratio = None
 
-            if state in losses_by_state:
-                try:
-                    win_ratio = len(wins) / (len(wins) + len(losses_by_state[state]))
-                except ZeroDivisionError:
+                if state in losses_by_state:
+                    try:
+                        win_ratio = len(wins) / (len(wins) + len(losses_by_state[state]))
+                    except ZeroDivisionError:
+                        win_ratio = 'N/A'
+                else:
                     win_ratio = 'N/A'
-            else:
-                win_ratio = 'N/A'
 
-            if state not in states_stats:
-                states_stats[state] = { 'avg_loss_rating_diff': 'N/A', 'median_loss_rating_diff': 'N/A', 'num_losses': 'N/A' }
-            states_stats[state]['avg_win_rating_diff'] = numpy.mean(wins) if wins else 'N/A'
-            states_stats[state]['median_win_rating_diff'] = numpy.median(wins) if wins else 'N/A'
-            states_stats[state]['num_wins'] = len(wins) if wins else 'N/A'
-            states_stats[state]['win_ratio'] = win_ratio
+                if state not in states_stats:
+                    states_stats[state] = { 'avg_loss_rating_diff': 'N/A', 'median_loss_rating_diff': 'N/A', 'num_losses': 'N/A' }
+                states_stats[state]['avg_win_rating_diff'] = numpy.mean(wins) if wins else 'N/A'
+                states_stats[state]['median_win_rating_diff'] = numpy.median(wins) if wins else 'N/A'
+                states_stats[state]['num_wins'] = len(wins) if wins else 'N/A'
+                states_stats[state]['win_ratio'] = win_ratio
 
-        aggregate_losses = list(itertools.chain(*losses_by_state.values()))
-        aggregate_wins = list(itertools.chain(*wins_by_state.values()))
+            aggregate_losses = list(itertools.chain(*losses_by_state.values()))
+            aggregate_wins = list(itertools.chain(*wins_by_state.values()))
 
-        location_stats[location] = calculate_statistics_helper(aggregate_losses, aggregate_wins)
-        location_stats[location]['states_stats'] = states_stats
+            if rating_interval not in location_stats:
+                location_stats[rating_interval] = { location: {} }
+
+            location_stats[rating_interval][location] = calculate_statistics_helper(aggregate_losses, aggregate_wins)
+            location_stats[rating_interval][location]['states_stats'] = states_stats
 
     return location_stats
 
-def create_aggregated_statistics_worksheet(location_stats, workbook):
-    aggregate_states_worksheet = workbook.add_worksheet('State Aggregated Statistics')
-    sorted_locations = sorted([location for location in location_stats if location_stats[location]['states_stats']], key=lambda loc: (len(loc), loc))
-    first_location = sorted_locations[0]
+def create_rating_interval_statistics_worksheet(location_stats, stats, workbook):
+    sorted_rating_intervals = sorted(list(location_stats.keys()), key=lambda interval: int(interval.split(':')[0].replace('+', '')))
 
-    aggregate_states_worksheet.set_column(0, 0, 20)
+    for rating_interval in sorted_rating_intervals:
+        locations = set()
+        states = set()
 
-    for row_index, stat_name in enumerate(sorted([stat_name for stat_name in location_stats[first_location].keys() if stat_name != 'states_stats']), 1):
-        aggregate_states_worksheet.write(row_index, 0, stat_name, workbook.add_format({ 'bold': True }))
+        for location in location_stats[rating_interval]:
+            locations.add(location)
 
-    for col_index, location in enumerate(sorted_locations, 1):
-        aggregate_states_worksheet.write(0, col_index, location, workbook.add_format({ 'bold': True, 'align': 'center' }))
+            if 'states_stats' in location_stats[rating_interval][location]:
+                for state in location_stats[rating_interval][location]['states_stats']:
+                    states.add(state)
 
-        for row_index, stat_name in enumerate(sorted([stat_name for stat_name in location_stats[location].keys() if stat_name != 'states_stats']), 1):
-            try:
-                if stat_name != 'states_stats':
-                    aggregate_states_worksheet.write(row_index, col_index, location_stats[location][stat_name], workbook.add_format({ 'align': 'center' }))
-            except TypeError:
-                continue
+        sorted_locations = sorted(list(locations), key=lambda loc: (len(loc), loc))
+        sorted_states = sorted(list(states), key=lambda state: (len(state), state))
+        sorted_states_index_mapping = { state: index for index, state in enumerate(sorted_states) }
+        rating_interval_worksheet = workbook.add_worksheet('{} Statistics'.format(rating_interval.replace(':', ' to ')))
+        stat_title_row_index = 0
 
-def create_state_statistics_worksheet(location_stats, workbook):
-    states_worksheet = workbook.add_worksheet('State Statistics')
-    stats = sorted(['avg_loss_rating_diff', 'avg_win_rating_diff', 'median_loss_rating_diff', 'median_win_rating_diff', 'num_losses', 'num_wins', 'win_ratio'])
-    stat_title_row_index = 0
-    sorted_locations = sorted([location for location in location_stats if location_stats[location]['states_stats']], key=lambda loc: (len(loc), loc))
-    sorted_states = sorted(list(set(itertools.chain.from_iterable([list(location_stats[location]['states_stats'].keys()) for location in location_stats]))), key=lambda loc: (len(loc), loc))
-    sorted_states_index_mapping = { state: index for index, state in enumerate(sorted_states) }
+        rating_interval_worksheet.set_column(0, 0, 20)
 
-    states_worksheet.set_column(0, 0, 20)
+        for stat in stats:
+            rating_interval_worksheet.write(stat_title_row_index, 0, stat, workbook.add_format({ 'bold': True, 'font_size': 20 }))
+            for location_index, location in enumerate(sorted_locations):
+                stat_table_row_index = stat_title_row_index + 2
 
-    for stat in stats:
-        states_worksheet.write(stat_title_row_index, 0, stat, workbook.add_format({ 'bold': True, 'font_size': 20 }))
-        for location_index, location in enumerate(sorted_locations):
-            stat_table_row_index = stat_title_row_index + 2
+                rating_interval_worksheet.write(stat_table_row_index + location_index + 1, 0, location, workbook.add_format({ 'bold': True, 'align': 'center' }))
 
-            states_worksheet.write(stat_table_row_index + location_index + 1, 0, location, workbook.add_format({ 'bold': True, 'align': 'center' }))
+                for state in sorted_states:
+                    rating_interval_worksheet.write(stat_table_row_index, sorted_states_index_mapping[state] + 1, state, workbook.add_format({ 'bold': True, 'align': 'center' }))
 
-            for state in sorted_states:
-                states_worksheet.write(stat_table_row_index, sorted_states_index_mapping[state] + 1, state, workbook.add_format({ 'bold': True, 'align': 'center' }))
+                    if not location_stats[rating_interval][location]['states_stats'] or state not in location_stats[rating_interval][location]['states_stats']:
+                        rating_interval_worksheet.write(stat_table_row_index + location_index + 1, sorted_states_index_mapping[state] + 1, 'N/A', workbook.add_format({ 'align': 'center' }))
+                    elif stat in location_stats[rating_interval][location]['states_stats'][state]:
+                        state_stat = location_stats[rating_interval][location]['states_stats'][state][stat]
 
-                if not location_stats[location]['states_stats'] or state not in location_stats[location]['states_stats']:
-                    states_worksheet.write(stat_table_row_index + location_index + 1, sorted_states_index_mapping[state] + 1, 'N/A', workbook.add_format({ 'align': 'center' }))
-                elif stat in location_stats[location]['states_stats'][state]:
-                    state_stat = location_stats[location]['states_stats'][state][stat]
+                        rating_interval_worksheet.write(stat_table_row_index + location_index + 1, sorted_states_index_mapping[state] + 1, state_stat, workbook.add_format({ 'align': 'center' }))
+                    else:
+                        rating_interval_worksheet.write(stat_table_row_index + location_index + 1, sorted_states_index_mapping[state] + 1, 'N/A', workbook.add_format({ 'align': 'center' }))
 
-                    states_worksheet.write(stat_table_row_index + location_index + 1, sorted_states_index_mapping[state] + 1, state_stat, workbook.add_format({ 'align': 'center' }))
-                else:
-                    states_worksheet.write(stat_table_row_index + location_index + 1, sorted_states_index_mapping[state] + 1, 'N/A', workbook.add_format({ 'align': 'center' }))
+            stat_title_row_index = stat_table_row_index + len(sorted_locations) + 2
 
-        stat_title_row_index = stat_table_row_index + len(sorted_locations) + 2
-
-def create_excel_workbook(location_stats):
+def create_excel_workbook(location_stats, sorted_locations):
     if list(location_stats.keys()):
         workbook = xlsxwriter.Workbook('tt_statistics.xlsx')
+        stats = sorted(['avg_loss_rating_diff', 'avg_win_rating_diff', 'median_loss_rating_diff', 'median_win_rating_diff', 'num_losses', 'num_wins', 'win_ratio'])
 
-        create_aggregated_statistics_worksheet(location_stats, workbook)
-        create_state_statistics_worksheet(location_stats, workbook)
+        create_rating_interval_statistics_worksheet(location_stats, stats, workbook)
         workbook.close()
     else:
         return print('Not enough data to create an excel workbook.')
@@ -428,14 +467,16 @@ def main():
     vs international players in certain matches. Individually adding the international players is an arduous process and
     adds to overhead, so we need to fill out the dictionary beforehand for all players (US and international).
     '''
-
-    player_info_dict, location_info_dict = get_preliminary_dicts(us_cities_states_dict)
+    rating_intervals = create_interval_tree()
+    player_info_dict, location_info_dict = get_preliminary_dicts(rating_intervals, us_cities_states_dict)
     print('Finished retrieving preliminary info.')
     print('Number of players in player_info_dict: {}\n'.format(len(player_info_dict)))
 
-    total_num_matches, populated_location_info_dict = get_main_info(player_info_dict, location_info_dict, us_cities_states_dict)
+    total_num_matches, populated_location_info_dict = get_main_info(rating_intervals, player_info_dict, location_info_dict, us_cities_states_dict)
     print('Finished retrieiving main info from a total of {} matches.'.format(total_num_matches))
-    print('Locations: {}\n'.format(sorted(list(populated_location_info_dict.keys())), key=lambda loc: (len(loc), loc)))
+
+    sorted_locations = sorted(list(set(itertools.chain.from_iterable([list(location.keys()) for location in populated_location_info_dict.values()]))), key=lambda loc: (len(loc), loc))
+    print('Locations: {}\n'.format(sorted_locations))
 
     if not USE_MAX:
         pprint(populated_location_info_dict)
@@ -443,10 +484,8 @@ def main():
     location_stats = calculate_statistics(populated_location_info_dict)
     print('Finished calculating statistics.')
 
-    if not USE_MAX:
-        pprint(populated_location_info_dict)
-
-    create_excel_workbook(location_stats)
+    create_excel_workbook(location_stats, sorted_locations)
+    print('Finished creating excel workbook.')
 
 if __name__ == '__main__':
     main()
