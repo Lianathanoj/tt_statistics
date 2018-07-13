@@ -429,6 +429,7 @@ def create_rating_interval_statistics_worksheet(location_stats, stats, workbook)
 
         for stat in stats:
             rating_interval_worksheet.write(stat_title_row_index, 0, stat, workbook.add_format({ 'bold': True, 'font_size': 20 }))
+
             for location_index, location in enumerate(sorted_locations):
                 stat_table_row_index = stat_title_row_index + 2
 
