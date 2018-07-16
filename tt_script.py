@@ -474,7 +474,7 @@ def main():
     print('Number of players in player_info_dict: {}\n'.format(len(player_info_dict)))
 
     total_num_matches, populated_location_info_dict = get_main_info(rating_intervals, player_info_dict, location_info_dict, us_cities_states_dict)
-    print('Finished retrieiving main info from a total of {} matches.'.format(total_num_matches))
+    print('Finished retrieiving main info from a total of {} matches.\n'.format(total_num_matches))
 
     sorted_locations = sorted(list(set(itertools.chain.from_iterable([list(location.keys()) for location in populated_location_info_dict.values()]))), key=lambda loc: (len(loc), loc))
     print('Locations: {}\n'.format(sorted_locations))
